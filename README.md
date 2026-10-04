@@ -13,37 +13,60 @@ reported in milliseconds and GFLOPS, and verified against the CPU output. cuBLAS
 included as a fourth measurement so the hand-written kernels have a realistic ceiling
 to be judged against.
 
-## Why tiling wins
+## How tiling works
 
-In the naive kernel each thread computes one element of `C` and reads a full row of
-`A` and a full column of `B` from global memory. Across a block, the same values are
-fetched over and over: every element of `B` is read by all N threads in its column.
-Arithmetic is cheap and DRAM bandwidth is not, so the kernel is memory bound and the
-SMs spend most of their time waiting.
+In the naive kernel each thread computes one element of `C` and walks a full row of
+`A` and a full column of `B`. Within a warp `threadIdx.x` varies fastest, so `col`
+varies and the reads of `B` are already coalesced - the naive kernel is not the
+pathological uncoalesced version you sometimes see. What it still does is re-fetch the
+same values across the block: every element of `B` is read by all N threads in its
+column, and every element of `A` by all N threads in its row.
 
-The tiled kernel gives each block a `16x16` staging area in shared memory. Per step,
-every thread loads exactly one element of `A` and one of `B` into that scratchpad,
-the block synchronises, and then each thread reads 16 values back out of on-chip
-memory to accumulate partial products. Each loaded value is used 16 times instead of
-once, cutting global memory traffic by roughly the tile width and shifting the kernel
-toward being compute bound.
+The tiled kernel gives each block a `16x16` staging area in shared memory. Per step
+every thread loads exactly one element of `A` and one of `B` into that scratchpad, the
+block synchronises, and then each thread reads 16 values back out of on-chip memory to
+accumulate partial products. Each loaded value is used 16 times instead of once, which
+cuts requests to the memory system by roughly the tile width.
 
 ## Results
 
-Measured on a Tesla T4 (Colab), `nvcc -O3 -arch=sm_75`. GPU times are the mean of 5
-runs after one warm-up; the CPU baseline is a single run. Times cover the multiply
+Measured on a Tesla T4 (sm_75, 40 SMs, 15 GB) on Colab, `nvcc -O3 -arch=sm_75`.
+GPU times are the mean of 5 runs after one warm-up; the CPU baseline is a single run. Times cover the multiply
 only - host/device transfers are excluded.
 
-<!-- Paste the ./matmul output here. The program prints these tables in markdown. -->
+| N | CPU (ms) | Naive (ms) | Tiled (ms) | cuBLAS (ms) | Tiled GFLOPS | Tiled vs naive | Tiled vs CPU | Tiled % of cuBLAS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 23.6 | 0.67 | 0.44 | 0.08 | 616 | 1.54x | 54x | 18.9% |
+| 1024 | 203.0 | 5.22 | 3.34 | 0.49 | 642 | 1.56x | 61x | 14.5% |
+| 2048 | 1773.6 | 48.06 | 25.20 | 2.90 | 682 | 1.91x | 70x | 11.5% |
 
-| N | CPU (ms) | Naive (ms) | Tiled (ms) | cuBLAS (ms) | Tiled GFLOPS | Tiled vs naive | Tiled % of cuBLAS |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| 512 | | | | | | | |
-| 1024 | | | | | | | |
-| 2048 | | | | | | | |
+cuBLAS peaks at 5933 GFLOPS at N=2048, about 73% of the T4's ~8.1 TFLOPS fp32
+ceiling. The tiled kernel's 682 GFLOPS is ~8% of that ceiling.
+
+### Reading these numbers honestly
+
+Tiling buys **1.9x over naive at N=2048**, not the 10x the "16x less traffic" argument
+would suggest. Two reasons, and both are the actual lesson of the project:
+
+- The naive kernel's loads are coalesced and its working set hits the T4's 4 MB L2, so
+  it was never paying full DRAM latency on most accesses. Tiling moves traffic from L2
+  to shared memory, a smaller win than DRAM-to-shared would have been.
+- At `16x16`, each thread computes a single output and the inner loop is two shared
+  loads per fused multiply-add. That ratio, not memory bandwidth, is now the limit -
+  the kernel is bound by shared-memory throughput and loop overhead rather than DRAM.
+
+That is also why the gap to cuBLAS stays large: cuBLAS gets its remaining ~9x from
+register blocking (each thread computing a patch of `C`, so loaded values are reused
+out of registers rather than re-read from shared memory), double-buffered loads, and
+tuning per shape. The honest summary is that ~60 lines of tiled CUDA gets within an
+order of magnitude of a vendor library, and the next 10x needs register blocking.
+
+Note the speedup grows with N (1.54x to 1.91x) - the larger the matrix, the less of it
+fits in cache and the more the staging pays off.
 
 All GPU results are verified against the CPU output to within a `1e-3` relative
-tolerance; the benchmark exits non-zero if any implementation drifts past it.
+tolerance - worst observed was `3.4e-06`. The benchmark exits non-zero if any
+implementation drifts past it.
 
 ## Running it
 
